@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rid: [win-x64, win-arm64, linux-x64, osx-arm64]
+        rid: [win-arm64, linux-x64, osx-arm64]
     steps:
       - uses: actions/checkout@v4
 
@@ -67,10 +67,45 @@ jobs:
             WindowsStress-${{ matrix.rid }}.tar.gz
           if-no-files-found: error
 
+  build-win-aot:
+    name: Build win-x64 (small, NativeAOT)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish NativeAOT executable
+        shell: bash
+        run: >
+          dotnet publish WindowsStress -c Release
+          -r win-x64
+          -p:PublishAot=true
+          -p:IlcOptimizationPreference=Size
+          -p:DebugType=None -p:DebugSymbols=false
+          -o publish/win-x64
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item publish/win-x64/WindowsStress.exe WindowsStress-win-x64.exe
+          Compress-Archive -Path publish/win-x64/WindowsStress.exe, README.md, LICENSE -DestinationPath WindowsStress-win-x64.zip
+          Get-Item WindowsStress-win-x64.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WindowsStress-win-x64
+          path: |
+            WindowsStress-win-x64.exe
+            WindowsStress-win-x64.zip
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
-    if: github.event_name != 'pull_request'
+    needs: [build, build-win-aot]
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
