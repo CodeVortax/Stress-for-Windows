@@ -16,6 +16,7 @@ namespace WindowsStress
         public int Seconds = 60;
         public int RamPercent = -1;      // -1 = mode default
         public string Priority = null;   // null = mode default
+        public int MineMem = 32;         // MB scratchpad per mining thread
         public bool Yes;
     }
 
@@ -33,6 +34,8 @@ Modes:
   hash     SHA-256/512/1, MD5, SHA3, PBKDF2
   zip      GZip / Brotli / Deflate / ZLib compress + decompress round trips
   scratch  CryptoNight/RandomX style: 2 MB AES scratchpad per thread (cache stress)
+  mine     offline mining-style load: memory-hard hash with random reads, AES, floating point
+           (counts hashes/s and 'shares'; NO network, NO pool, NO coins)
   ram      MemTest style: fills RAM with patterns, random XOR walks, verifies
   fun      Mandelbrot + prime sieve
   all      everything above together, RAM budget 40% of free memory
@@ -43,6 +46,7 @@ Options:
   --threads N     number of worker threads, or 'all' (default: all logical cores)
   --time S        duration in seconds, 0 = until Ctrl+C (default 60)
   --ram P         percent of FREE RAM to grab, 1-95 (ram/all/kill modes)
+  --mine-mem MB   scratchpad per mining thread, 2-1024 (default 32; auto-reduced if RAM is low)
   --priority X    low | normal | high (default low; kill uses high)
   --yes           skip the confirmation prompt
   -h, --help      show this help
@@ -50,6 +54,7 @@ Options:
 Examples:
   WindowsStress cpu --time 300
   WindowsStress hash --load 50 --time 120
+  WindowsStress mine --mine-mem 256 --time 300
   WindowsStress ram --ram 70 --time 600
   WindowsStress kill --time 120
 
@@ -58,7 +63,7 @@ which means the CPU, RAM or power supply is not stable under this load.
 Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
 ";
 
-        static readonly string[] Modes = { "cpu", "hash", "zip", "scratch", "ram", "fun", "all", "kill" };
+        static readonly string[] Modes = { "cpu", "hash", "zip", "scratch", "mine", "ram", "fun", "all", "kill" };
 
         static int Main(string[] args)
         {
@@ -110,6 +115,15 @@ Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
             }
 
             SetPriority(o.Priority);
+
+            // mining scratchpads: keep them below 25% of free RAM in total
+            if ((o.Mode == "mine" || o.Mode == "all" || o.Mode == "kill") && o.Threads > 0)
+            {
+                long allowedMb = (long)(free * 0.25) / o.Threads / (1024 * 1024);
+                MineWorker.PadMB = (int)Math.Max(2, Math.Min(o.MineMem, allowedMb));
+                Console.WriteLine("Mining scratchpad: {0} MB per thread{1}", MineWorker.PadMB,
+                    MineWorker.PadMB < o.MineMem ? " (reduced to fit RAM)" : "");
+            }
 
             // ---- build workers
             int computeThreads = o.Mode == "ram" ? 0 : o.Threads;
@@ -180,6 +194,12 @@ Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
                     Human(ops, bytes), Human((long)(ops / secs), bytes) + "/s", errs);
             }
 
+            long shares = all.Sum(w => w.Shares);
+            long hashes = all.Where(w => w.Name == "mine-memhard").Sum(w => w.Ops);
+            if (hashes > 0)
+                Console.WriteLine("\nMining: {0} hashes ({1:0.##} H/s), {2} shares found (offline test, nothing was submitted anywhere)",
+                    hashes, hashes / secs, shares);
+
             long totalErrors = Interlocked.Read(ref Reporter.TotalErrors);
             Console.WriteLine();
             if (totalErrors == 0)
@@ -201,6 +221,7 @@ Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
             if (mode == "hash" || everything) l.Add(new HashWorker());
             if (mode == "zip" || everything) l.Add(new ZipWorker());
             if (mode == "scratch" || everything) l.Add(new ScratchWorker());
+            if (mode == "mine" || everything) l.Add(new MineWorker());
             if (mode == "fun" || everything) { l.Add(new MandelWorker()); l.Add(new SieveWorker()); }
             return l;
         }
@@ -256,6 +277,9 @@ Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
                     case "--ram":
                         if (i + 1 >= a.Length || !int.TryParse(a[++i], out o.RamPercent)) return "--ram needs a percentage";
                         break;
+                    case "--mine-mem":
+                        if (i + 1 >= a.Length || !int.TryParse(a[++i], out o.MineMem)) return "--mine-mem needs a number of MB";
+                        break;
                     case "--threads":
                         if (i + 1 >= a.Length) return "--threads needs a number or 'all'";
                         string v = a[++i];
@@ -283,6 +307,7 @@ Ctrl+C stops the test cleanly. Exit code: 0 = no errors, 2 = errors found.
             if (o.Load < 1 || o.Load > 100) return "load must be between 1 and 100";
             if (o.Threads < 1) return "threads must be at least 1";
             if (o.Seconds < 0) return "time cannot be negative";
+            if (o.MineMem < 2 || o.MineMem > 1024) return "--mine-mem must be between 2 and 1024";
 
             if (o.RamPercent < 0)
                 o.RamPercent = o.Mode == "kill" ? 90 : o.Mode == "all" ? 40 : o.Mode == "ram" ? 60 : 0;

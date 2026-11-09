@@ -93,6 +93,7 @@ namespace WindowsStress
         public readonly bool Bytes;   // true: Ops counts bytes, false: plain operations
         public long Ops;
         public long Errors;
+        public long Shares;   // only used by the mining worker
 
         protected Worker(string name, bool bytes) { Name = name; Bytes = bytes; }
 
@@ -392,6 +393,116 @@ namespace WindowsStress
             for (int i = 2; i <= Limit; i++) if (!comp[i]) count++;
             if (count != 148933) Fail("prime count was " + count + " instead of 148933");
             Ops += Limit;
+        }
+    }
+
+    // ---------------------------------------------------------------- Mining
+
+    /// <summary>
+    /// Offline proof-of-work style load (no network, no pool, no coins): a RandomX/scrypt flavoured,
+    /// memory-hard hash. Per nonce: seed with SHA-256, fill a big scratchpad, then run a long chain of
+    /// data-dependent random reads/writes where each step picks a different "instruction"
+    /// (integer, rotate, multiply, floating point sqrt, AES-NI), and finish with SHA-256.
+    /// A hash with enough leading zero bits counts as a "share". Every 4th nonce is hashed twice
+    /// and compared so unstable hardware shows up as an error.
+    /// </summary>
+    sealed class MineWorker : Worker
+    {
+        public static int PadMB = 32;       // scratchpad per thread
+        const int Difficulty = 12;          // leading zero bits for a share (about 1 in 4096 hashes)
+        const int Rounds = 200000;          // data-dependent steps per hash
+
+        readonly ulong[] pad;
+        readonly Aes aes;
+        readonly byte[] header = new byte[80];
+        readonly byte[] blk = new byte[16];
+        readonly byte[] enc = new byte[16];
+        readonly byte[] fin = new byte[24 + 8 * 64];
+        ulong nonce;
+
+        public MineWorker() : base("mine-memhard", false)
+        {
+            pad = new ulong[(int)((long)PadMB * 1024 * 1024 / 8)];
+            var r = new Random();
+            r.NextBytes(header);
+            var key = new byte[32];
+            r.NextBytes(key);
+            aes = Aes.Create();
+            aes.Key = key;
+            nonce = (ulong)r.NextInt64();
+        }
+
+        byte[] Hash(ulong n)
+        {
+            BitConverter.TryWriteBytes(header.AsSpan(72, 8), n);
+            byte[] seed = SHA256.HashData(header);
+            ulong a = BitConverter.ToUInt64(seed, 0) | 1UL;
+            ulong b = BitConverter.ToUInt64(seed, 8);
+
+            ulong f = BitConverter.ToUInt64(seed, 16) | 1UL;
+            for (int i = 0; i < pad.Length; i++) { Mixer.Next(ref f); pad[i] = f; }
+
+            double fp = 1.0 + (a & 0xFFFF) / 65536.0;
+            for (int r = 0; r < Rounds; r++)
+            {
+                int j = (int)(a % (ulong)pad.Length);
+                ulong v = pad[j];
+                switch ((int)(v & 7))
+                {
+                    case 0: a += v * 0x9E3779B97F4A7C15UL; break;
+                    case 1: a ^= (v << 17) | (v >> 47); break;
+                    case 2: a *= (v | 1UL); break;
+                    case 3:
+                        fp = Math.Sqrt(fp + (double)(v & 0xFFFFF));
+                        a ^= (ulong)BitConverter.DoubleToInt64Bits(fp);
+                        break;
+                    case 4: a = ((a << 13) | (a >> 51)) + v; break;
+                    case 5:
+                        BitConverter.TryWriteBytes(blk.AsSpan(0, 8), a);
+                        BitConverter.TryWriteBytes(blk.AsSpan(8, 8), v);
+                        aes.EncryptEcb(blk, enc, PaddingMode.None);
+                        a ^= BitConverter.ToUInt64(enc, 0);
+                        b ^= BitConverter.ToUInt64(enc, 8);
+                        break;
+                    case 6: b += a ^ v; a = b ^ (a >> 3); break;
+                    default: a -= v; a ^= b; break;
+                }
+                pad[j] = a ^ b ^ v;   // write back: the next read depends on this
+                b = ((b << 7) | (b >> 57)) ^ a;
+            }
+
+            BitConverter.TryWriteBytes(fin.AsSpan(0, 8), a);
+            BitConverter.TryWriteBytes(fin.AsSpan(8, 8), b);
+            BitConverter.TryWriteBytes(fin.AsSpan(16, 8), BitConverter.DoubleToInt64Bits(fp));
+            for (int i = 0; i < 64; i++)
+                BitConverter.TryWriteBytes(fin.AsSpan(24 + 8 * i, 8), pad[(int)((long)i * (pad.Length - 1) / 63)]);
+            return SHA256.HashData(fin);
+        }
+
+        static int LeadingZeroBits(byte[] h)
+        {
+            int z = 0;
+            foreach (byte x in h)
+            {
+                if (x == 0) { z += 8; continue; }
+                z += BitOperations.LeadingZeroCount((uint)x) - 24;
+                break;
+            }
+            return z;
+        }
+
+        public override void Step()
+        {
+            ulong n = nonce++;
+            byte[] h = Hash(n);
+            Ops++;
+            if ((n & 3) == 0)
+            {
+                byte[] h2 = Hash(n);
+                Ops++;
+                if (!h.AsSpan().SequenceEqual(h2)) Fail("same nonce gave two different hashes");
+            }
+            if (LeadingZeroBits(h) >= Difficulty) Shares++;
         }
     }
 
